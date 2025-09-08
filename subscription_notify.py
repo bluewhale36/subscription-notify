@@ -47,8 +47,9 @@ def extract_notion_fields(notion_data):
         except Exception:
             cost = None
         # Format cost with thousand separator and "₩" prefix if not None
+        cost_formatted = None
         if cost is not None:
-            cost = f"₩{int(cost):,}"
+            cost_formatted = f"₩{int(cost):,}"
         # Date Remaining
         date_remaining = None
         try:
@@ -65,7 +66,8 @@ def extract_notion_fields(notion_data):
         next_renewal = properties.get("Next Renewal", {}).get("formula", {}).get("date", {}).get("start", None)
         results.append({
             "name": name,
-            "cost": cost,
+            "cost": cost_formatted,
+            "cost_raw": cost,
             "date_remaining": date_remaining,
             "status": status,
             "next_renewal": next_renewal
@@ -81,50 +83,66 @@ def filter_for_notifications(extracted):
     3. date_remaining 값에 따라 due_today, due_soon, overdue 리스트로 분리하여 반환합니다.
     """
     allowed_days = {1, 2, 3, 5, 7}
-    filtered = [
-        item for item in extracted
-        if item.get("status") == "Active"
-        and (item.get("date_remaining") == 0 or item.get("date_remaining") in allowed_days or (item.get("date_remaining") is not None and item.get("date_remaining") < 0))
-    ]
-    due_today = [item for item in filtered if item.get("date_remaining") == 0]
-    due_soon = [item for item in filtered if item.get("date_remaining") in allowed_days]
-    overdue = [item for item in filtered if item.get("date_remaining") is not None and item.get("date_remaining") < 0]
+    due_today, due_soon, overdue = [], [], []
+    for item in extracted:
+        if item.get("status") != "Active":
+            continue
+        dr = item.get("date_remaining")
+        if dr is None:
+            continue
+        if dr < 0:
+            overdue.append(item)
+        elif dr == 0:
+            due_today.append(item)
+        elif dr in allowed_days:
+            due_soon.append(item)
     return (due_today, due_soon, overdue)
+
+def generate_section_message(header, items):
+    """
+    Given a header and list of items, sort items by next_renewal ascending and cost_raw descending,
+    then format the message with up to 4 items, adding a line for remaining count if more than 4.
+    Returns the formatted string.
+    """
+    # Sort items by next_renewal ascending, cost_raw descending
+    def sort_key(item):
+        nr = item.get("next_renewal")
+        cost_raw = item.get("cost_raw") or 0
+        return (nr if nr is not None else "", -cost_raw)
+    sorted_items = sorted(items, key=sort_key)
+    lines = [header]
+    display_items = sorted_items[:4]
+    for item in display_items:
+        name = item.get("name") or ""
+        cost = item.get("cost") or ""
+        date_remaining = item.get("date_remaining")
+        next_renewal = item.get("next_renewal") or ""
+        if header.startswith("❗ 결제 예정일이 지난 서비스"):
+            # Overdue: D+{abs(date_remaining)}
+            lines.append(f"  • {name} | {cost} | D+{abs(date_remaining)} ({next_renewal})")
+        elif header.startswith("❗ 오늘 결제 예정인 서비스"):
+            # Due today: D-0
+            lines.append(f"  • {name} | {cost} | D-0 ({next_renewal})")
+        else:
+            # Due soon: D-{date_remaining}
+            lines.append(f"  • {name} | {cost} | D-{date_remaining} ({next_renewal})")
+    remaining = len(sorted_items) - len(display_items)
+    if remaining > 0:
+        lines.append(f"  • 이 외 {remaining}개")
+    return "\n".join(lines)
 
 def generate_notification_messages(overdue, due_today, due_soon):
     """
-    알림 메시지를 생성합니다.
-    overdue, due_today, due_soon 리스트를 받아 각각의 상태에 맞는 메시지를 생성하여 리스트로 반환합니다.
+    Generate a list of notification section messages for overdue, due_today, and due_soon lists.
+    Returns a list of strings.
     """
     messages = []
     if overdue:
-        lines = ["❗ 결제 예정일이 지난 서비스가 있습니다!"]
-        for item in overdue:
-            name = item.get("name") or ""
-            cost = item.get("cost") or ""
-            date_remaining = item.get("date_remaining")
-            next_renewal = item.get("next_renewal") or ""
-            # For overdue, display D+{abs(date_remaining)} instead of D--n
-            lines.append(f"  • {name} | {cost} | D+{abs(date_remaining)} ({next_renewal})")
-        messages.append("\n".join(lines))
+        messages.append(generate_section_message("❗ 결제 예정일이 지난 서비스가 있습니다!", overdue))
     if due_today:
-        lines = ["❗ 오늘 결제 예정인 서비스가 있습니다."]
-        for item in due_today:
-            name = item.get("name") or ""
-            cost = item.get("cost") or ""
-            next_renewal = item.get("next_renewal") or ""
-            lines.append(f"  • {name} | {cost} | D-0 ({next_renewal})")
-        messages.append("\n".join(lines))
+        messages.append(generate_section_message("❗ 오늘 결제 예정인 서비스가 있습니다.", due_today))
     if due_soon:
-        lines = ["⚠️ 일주일 이내 결제 예정인 서비스가 있습니다."]
-        for item in due_soon:
-            name = item.get("name") or ""
-            cost = item.get("cost") or ""
-            date_remaining = item.get("date_remaining")
-            next_renewal = item.get("next_renewal") or ""
-            # D-{date_remaining} ({next_renewal}), but date_remaining should not be 0 here
-            lines.append(f"  • {name} | {cost} | D-{date_remaining} ({next_renewal})")
-        messages.append("\n".join(lines))
+        messages.append(generate_section_message("⚠️ 일주일 이내 결제 예정인 서비스가 있습니다.", due_soon))
     return messages
 
 def send_pushover_message(token, user, message):
@@ -144,10 +162,9 @@ def send_pushover_message(token, user, message):
 def lambda_handler(event, context):
     # You can switch between live Notion API data and test data by commenting/uncommenting below:
     notion_data = fetch_notion_data()  # For live API
-    # notion_data = TEST_NOTION_DATA      # For testing with mock data
     extracted = extract_notion_fields(notion_data)
     due_today, due_soon, overdue = filter_for_notifications(extracted)
-    # Generate and print notification messages
+    # Generate and print notification messages list
     messages = generate_notification_messages(overdue, due_today, due_soon)
     for message in messages:
         print("\n" + message)
